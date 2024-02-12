@@ -7,6 +7,7 @@
 
 
 #include <Windows.h>
+#pragma comment(lib, "Synchronization.lib")
 
 typedef LONG(NTAPI* NtProcess)(HANDLE ProcessHandle);
 
@@ -14,63 +15,45 @@ NtProcess NtSuspendProcess = (NtProcess)GetProcAddress(GetModuleHandle(L"ntdll")
 NtProcess NtResumeProcess  = (NtProcess)GetProcAddress(GetModuleHandle(L"ntdll"), "NtResumeProcess");
 
 static HANDLE suspendedProcess = NULL;
+static bool runThread = false;
 
-static int keyState = 0;
 
-static PTP_TIMER timer = NULL;
-static HANDLE tick = CreateEvent(NULL, true, FALSE, NULL);
-static bool isTimerRestarted = false;
-
-VOID CALLBACK TimerTickCallback(PTP_CALLBACK_INSTANCE Instance, PVOID unusage, PTP_TIMER timer)
+void CALLBACK WorkCallback(PTP_CALLBACK_INSTANCE Instance, PVOID Parameter, PTP_WORK Work)
 {
-    ResetEvent(tick);
+    if (suspendedProcess != NULL)
+    {
+        NtResumeProcess(suspendedProcess);
+        CloseHandle(suspendedProcess);
+        suspendedProcess = NULL;
 
-    if (!keyState) return;
+        return;
+    }
+
+    bool cmp = runThread;
+    WaitOnAddress(&runThread, &cmp, sizeof(bool), 2000); // 2 sec delay for key pressing.
+    if (runThread == false) return; // The key was released.
 
     DWORD processID = 0;
     GetWindowThreadProcessId(GetForegroundWindow(), &processID);
 
     suspendedProcess = OpenProcess(THREAD_ALL_ACCESS, TRUE, processID);
-
     NtSuspendProcess(suspendedProcess);
-}
-
-
-void RestartTimer()
-{
-    isTimerRestarted = true;
-    if (timer != NULL)
-    {
-        ResetEvent(tick);
-        CloseThreadpoolTimer(timer);
-        timer = NULL;
-    }
-    ULARGE_INTEGER ulDueTime = { 0 };
-    ulDueTime.QuadPart = 2000 * (-10000); // 2 sec delay.
-    FILETIME FileDueTime = { 0 };
-    FileDueTime.dwHighDateTime = ulDueTime.HighPart;
-    FileDueTime.dwLowDateTime = ulDueTime.LowPart;
-
-    timer = CreateThreadpoolTimer(TimerTickCallback, NULL, NULL);
-    ResetEvent(tick);
-    SetThreadpoolTimer(timer, &FileDueTime, 0, 0);
 }
 
 
 LRESULT keyboardProcessing(int code, WPARAM w, LPARAM l)
 {
-    keyState = w == WM_KEYDOWN;
-    if (!keyState) isTimerRestarted = false;  // Allow to restart the timer only when the key is released.
+    if (((PKBDLLHOOKSTRUCT)l)->vkCode != VK_ESCAPE) return CallNextHookEx(NULL, code, w, l);
 
-    if (((PKBDLLHOOKSTRUCT)l)->vkCode == VK_ESCAPE && keyState && !isTimerRestarted)
+    if (w == WM_KEYUP && runThread)
     {
-        if (suspendedProcess != NULL)
-        {
-            NtResumeProcess(suspendedProcess);
-            CloseHandle(suspendedProcess);
-            suspendedProcess = NULL;
-        }
-        else if (!isTimerRestarted) RestartTimer(); // Don't call the function while the key is pressed.
+        runThread = false;
+        WakeByAddressAll(&runThread);
+    }
+    else if (!runThread) // Don't create the thread while the key is pressed.
+    {
+        runThread = true;
+        SubmitThreadpoolWork(CreateThreadpoolWork((PTP_WORK_CALLBACK)WorkCallback, NULL, NULL));
     }
 
     return CallNextHookEx(NULL, code, w, l);
@@ -80,8 +63,8 @@ int main()
 {
     ShowWindow(GetConsoleWindow(), SW_HIDE);
 
+    PTP_POOL threadPool = CreateThreadpool(NULL);
     HHOOK kHook = SetWindowsHookEx(WH_KEYBOARD_LL, (HOOKPROC)&keyboardProcessing, GetModuleHandle(NULL), 0);
-
 
     int retVal;
     MSG msg;
@@ -94,4 +77,5 @@ int main()
     };
 
     UnhookWindowsHookEx(kHook);
+    CloseThreadpool(threadPool);
 }
