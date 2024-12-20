@@ -8,36 +8,25 @@
 
 #include <Windows.h>
 #pragma comment(lib, "Synchronization.lib")
+#pragma comment(lib, "Winmm.lib")
 
 typedef LONG(NTAPI* NtProcess)(HANDLE ProcessHandle);
 
-NtProcess NtSuspendProcess = (NtProcess)GetProcAddress(GetModuleHandle(L"ntdll"), "NtSuspendProcess");
-NtProcess NtResumeProcess  = (NtProcess)GetProcAddress(GetModuleHandle(L"ntdll"), "NtResumeProcess");
+static NtProcess NtSuspendProcess = (NtProcess)GetProcAddress(GetModuleHandle(L"ntdll"), "NtSuspendProcess");
+static NtProcess NtResumeProcess  = (NtProcess)GetProcAddress(GetModuleHandle(L"ntdll"), "NtResumeProcess");
 
 static HANDLE suspendedProcess = NULL;
-static bool runThread = false;
+static bool   isKeyPressed     = false;
+static MMRESULT _timer         = NULL;
 
 
-void CALLBACK WorkCallback(PTP_CALLBACK_INSTANCE Instance, PVOID Parameter, PTP_WORK Work)
+VOID CALLBACK WorkCallback(UINT uTimerID, UINT uMsg, DWORD_PTR dwUser, DWORD_PTR dw1, DWORD_PTR dw2)
 {
-    if (suspendedProcess != NULL)
-    {
-        NtResumeProcess(suspendedProcess);
-        CloseHandle(suspendedProcess);
-        suspendedProcess = NULL;
-
-        return;
-    }
-
-    bool cmp = runThread;
-    WaitOnAddress(&runThread, &cmp, sizeof(bool), 2000); // 2 sec delay for key pressing.
-    if (runThread == false) return; // The key was released.
+    if (!isKeyPressed) return;
 
     DWORD processID = 0;
-    GetWindowThreadProcessId(GetForegroundWindow(), &processID);
-
-    suspendedProcess = OpenProcess(THREAD_ALL_ACCESS, TRUE, processID);
-    NtSuspendProcess(suspendedProcess);
+    GetWindowThreadProcessId((HWND)dwUser, &processID);
+    NtSuspendProcess(suspendedProcess = OpenProcess(THREAD_ALL_ACCESS | PROCESS_SUSPEND_RESUME, TRUE, processID)); 
 }
 
 
@@ -45,19 +34,32 @@ LRESULT keyboardProcessing(int code, WPARAM w, LPARAM l)
 {
     if (((PKBDLLHOOKSTRUCT)l)->vkCode != VK_ESCAPE) return CallNextHookEx(NULL, code, w, l);
 
-    if (w == WM_KEYUP && runThread)
+    if (w == WM_KEYUP)
     {
-        runThread = false;
-        WakeByAddressAll(&runThread);
+        isKeyPressed = false;
+        if (_timer != NULL) // If the user simulates input and sending UP event without DOWN before.
+        {
+            timeKillEvent(_timer);
+            _timer = NULL;
+        }
     }
-    else if (!runThread) // Don't create the thread while the key is pressed.
+    else if (!isKeyPressed)
     {
-        runThread = true;
-        SubmitThreadpoolWork(CreateThreadpoolWork((PTP_WORK_CALLBACK)WorkCallback, NULL, NULL));
+        isKeyPressed = true;
+
+        if (suspendedProcess != NULL)
+        {
+            NtResumeProcess(suspendedProcess);
+            CloseHandle(suspendedProcess);
+            suspendedProcess = NULL;
+            return CallNextHookEx(NULL, code, w, l);
+        }
+        _timer = timeSetEvent(2000, 0, WorkCallback, (DWORD_PTR)GetForegroundWindow(), TIME_CALLBACK_FUNCTION | TIME_KILL_SYNCHRONOUS | TIME_ONESHOT);
     }
 
     return CallNextHookEx(NULL, code, w, l);
 }
+
 
 int main()
 {
